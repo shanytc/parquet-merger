@@ -59,7 +59,6 @@ struct MergeProgress {
     message: String,
 }
 
-#[derive(Default)]
 struct ParquetMergerApp {
     /// List of folders to scan
     folders: Vec<PathBuf>,
@@ -79,6 +78,25 @@ struct ParquetMergerApp {
     merge_progress: MergeProgress,
     /// Search filter for files
     search_filter: String,
+    /// Auto-remove batches after successful merge
+    auto_remove_completed: bool,
+}
+
+impl Default for ParquetMergerApp {
+    fn default() -> Self {
+        Self {
+            folders: Vec::new(),
+            parquet_files: Vec::new(),
+            selected_files: HashSet::new(),
+            batches: Vec::new(),
+            status_message: String::new(),
+            is_processing: false,
+            export_to_csv: false,
+            merge_progress: MergeProgress::default(),
+            search_filter: String::new(),
+            auto_remove_completed: true, // Default to true
+        }
+    }
 }
 
 impl ParquetMergerApp {
@@ -221,6 +239,7 @@ impl ParquetMergerApp {
 
         let mut success_count = 0;
         let mut error_messages: Vec<String> = Vec::new();
+        let mut successful_batch_indices: Vec<usize> = Vec::new();
 
         for (batch_idx, batch) in self.batches.iter().enumerate() {
             self.merge_progress.current_batch = batch_idx + 1;
@@ -244,6 +263,7 @@ impl ParquetMergerApp {
             match merge_parquet_files(&files_to_merge, &output_path) {
                 Ok(row_count) => {
                     success_count += 1;
+                    successful_batch_indices.push(batch_idx);
 
                     // Export to CSV if checkbox is checked
                     if self.export_to_csv {
@@ -262,6 +282,14 @@ impl ParquetMergerApp {
                 Err(e) => {
                     error_messages.push(format!("'{}': {}", batch.name, e));
                 }
+            }
+        }
+
+        // Remove successful batches if auto-remove is enabled
+        if self.auto_remove_completed {
+            // Remove in reverse order to maintain correct indices
+            for &idx in successful_batch_indices.iter().rev() {
+                self.batches.remove(idx);
             }
         }
 
@@ -795,7 +823,10 @@ impl eframe::App for ParquetMergerApp {
                     {
                         self.merge_batches();
                     }
+                });
+                ui.horizontal(|ui| {
                     ui.checkbox(&mut self.export_to_csv, "CSV");
+                    ui.checkbox(&mut self.auto_remove_completed, "Auto-remove");
                 });
 
                 ui.add_space(8.0);
