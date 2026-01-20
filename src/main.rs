@@ -14,8 +14,8 @@ use parquet::file::properties::WriterProperties;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
-            .with_min_inner_size([600.0, 400.0]),
+            .with_inner_size([1100.0, 600.0])
+            .with_min_inner_size([900.0, 400.0]),
         ..Default::default()
     };
 
@@ -35,20 +35,50 @@ struct ParquetFile {
     display_path: String,
 }
 
+/// A batch of files to be merged together
+#[derive(Clone)]
+struct Batch {
+    /// Indices of files in this batch (references parquet_files)
+    file_indices: Vec<usize>,
+    /// Name of the batch (used for output filename)
+    name: String,
+    /// Whether there's a schema mismatch between files
+    has_schema_mismatch: bool,
+}
+
+/// Progress state for batch processing
+#[derive(Default)]
+struct MergeProgress {
+    /// Whether merge is in progress
+    is_merging: bool,
+    /// Current batch being processed (0-indexed)
+    current_batch: usize,
+    /// Total number of batches
+    total_batches: usize,
+    /// Progress message
+    message: String,
+}
+
 #[derive(Default)]
 struct ParquetMergerApp {
     /// List of folders to scan
     folders: Vec<PathBuf>,
     /// Found parquet files after scanning
     parquet_files: Vec<ParquetFile>,
-    /// Set of selected file indices for merging
+    /// Set of selected file indices for adding to batch
     selected_files: HashSet<usize>,
+    /// List of batches to process
+    batches: Vec<Batch>,
     /// Status message to display
     status_message: String,
     /// Whether an operation is in progress
     is_processing: bool,
     /// Whether to also export to CSV
     export_to_csv: bool,
+    /// Merge progress tracking
+    merge_progress: MergeProgress,
+    /// Search filter for files
+    search_filter: String,
 }
 
 impl ParquetMergerApp {
@@ -56,7 +86,8 @@ impl ParquetMergerApp {
         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
             if !self.folders.contains(&folder) {
                 self.folders.push(folder);
-                self.status_message = "Folder added. Click 'Scan' to find parquet files.".to_string();
+                // Auto-scan after adding folder
+                self.scan_folders();
             } else {
                 self.status_message = "Folder already in list.".to_string();
             }
@@ -68,6 +99,7 @@ impl ParquetMergerApp {
             self.folders.remove(index);
             self.parquet_files.clear();
             self.selected_files.clear();
+            self.batches.clear();
             self.status_message = "Folder removed.".to_string();
         }
     }
@@ -75,6 +107,7 @@ impl ParquetMergerApp {
     fn scan_folders(&mut self) {
         self.parquet_files.clear();
         self.selected_files.clear();
+        self.batches.clear();
 
         for folder in &self.folders {
             for entry in WalkDir::new(folder)
@@ -86,7 +119,6 @@ impl ParquetMergerApp {
                 if path.is_file() {
                     if let Some(ext) = path.extension() {
                         if ext.eq_ignore_ascii_case("parquet") {
-                            // Calculate relative path from the folder
                             let display_path = path
                                 .strip_prefix(folder)
                                 .map(|p| p.to_string_lossy().to_string())
@@ -110,74 +142,289 @@ impl ParquetMergerApp {
         self.status_message = format!("Found {} parquet file(s).", self.parquet_files.len());
     }
 
-    fn select_all(&mut self) {
-        for i in 0..self.parquet_files.len() {
-            self.selected_files.insert(i);
-        }
-    }
-
-    fn deselect_all(&mut self) {
-        self.selected_files.clear();
-    }
-
-    fn merge_selected(&mut self) {
+    fn add_batch(&mut self) {
         if self.selected_files.is_empty() {
-            self.status_message = "No files selected for merging.".to_string();
+            self.status_message = "No files selected. Select files first, then click '>'.".to_string();
             return;
         }
 
-        // Show save dialog
-        let save_path = rfd::FileDialog::new()
-            .add_filter("Parquet", &["parquet"])
-            .set_file_name("merged.parquet")
-            .save_file();
+        let mut file_indices: Vec<usize> = self.selected_files.iter().cloned().collect();
+        file_indices.sort();
 
-        let Some(output_path) = save_path else {
+        // Get file paths for schema check and name generation
+        let file_paths: Vec<&PathBuf> = file_indices
+            .iter()
+            .filter_map(|&i| self.parquet_files.get(i).map(|f| &f.full_path))
+            .collect();
+
+        let file_names: Vec<&str> = file_indices
+            .iter()
+            .filter_map(|&i| {
+                self.parquet_files.get(i).and_then(|f| {
+                    f.full_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                })
+            })
+            .collect();
+
+        // Check for schema mismatch
+        let has_schema_mismatch = check_schema_mismatch(&file_paths);
+
+        // Generate batch name from common parts of file names
+        let name = generate_batch_name(&file_names, self.batches.len() + 1);
+
+        self.batches.push(Batch {
+            file_indices,
+            name: name.clone(),
+            has_schema_mismatch,
+        });
+        self.selected_files.clear();
+
+        if has_schema_mismatch {
+            self.status_message = format!("Created batch '{}' (WARNING: schema mismatch detected!).", name);
+        } else {
+            self.status_message = format!("Created batch '{}'.", name);
+        }
+    }
+
+    fn remove_batch(&mut self, index: usize) {
+        if index < self.batches.len() {
+            self.batches.remove(index);
+            self.status_message = "Batch removed.".to_string();
+        }
+    }
+
+    fn merge_batches(&mut self) {
+        if self.batches.is_empty() {
+            self.status_message = "No batches to merge. Add batches first using '>'.".to_string();
+            return;
+        }
+
+        // Ask for output folder
+        let output_folder = rfd::FileDialog::new()
+            .set_title("Select output folder for merged files")
+            .pick_folder();
+
+        let Some(output_dir) = output_folder else {
             self.status_message = "Merge cancelled.".to_string();
             return;
         };
 
         self.is_processing = true;
-        self.status_message = "Merging files...".to_string();
+        self.merge_progress = MergeProgress {
+            is_merging: true,
+            current_batch: 0,
+            total_batches: self.batches.len(),
+            message: "Starting merge...".to_string(),
+        };
 
-        // Collect selected file paths (using full paths)
-        let files_to_merge: Vec<PathBuf> = self
-            .selected_files
-            .iter()
-            .filter_map(|&i| self.parquet_files.get(i).map(|f| f.full_path.clone()))
-            .collect();
+        let mut success_count = 0;
+        let mut error_messages: Vec<String> = Vec::new();
 
-        match merge_parquet_files(&files_to_merge, &output_path) {
-            Ok(row_count) => {
-                let mut status = format!(
-                    "Successfully merged {} files ({} total rows) to: {}",
-                    files_to_merge.len(),
-                    row_count,
-                    output_path.display()
-                );
+        for (batch_idx, batch) in self.batches.iter().enumerate() {
+            self.merge_progress.current_batch = batch_idx + 1;
+            self.merge_progress.message = format!("Processing '{}'...", batch.name);
 
-                // Export to CSV if checkbox is checked
-                if self.export_to_csv {
-                    let csv_path = output_path.with_extension("csv");
-                    match export_parquet_to_csv(&output_path, &csv_path) {
-                        Ok(()) => {
-                            status.push_str(&format!(" | CSV exported to: {}", csv_path.display()));
-                        }
-                        Err(e) => {
-                            status.push_str(&format!(" | CSV export failed: {}", e));
+            let files_to_merge: Vec<PathBuf> = batch
+                .file_indices
+                .iter()
+                .filter_map(|&i| self.parquet_files.get(i).map(|f| f.full_path.clone()))
+                .collect();
+
+            if files_to_merge.is_empty() {
+                error_messages.push(format!("'{}': No valid files", batch.name));
+                continue;
+            }
+
+            // Sanitize batch name for filename
+            let safe_name = sanitize_filename(&batch.name);
+            let output_path = output_dir.join(format!("{}.parquet", safe_name));
+
+            match merge_parquet_files(&files_to_merge, &output_path) {
+                Ok(row_count) => {
+                    success_count += 1;
+
+                    // Export to CSV if checkbox is checked
+                    if self.export_to_csv {
+                        let csv_path = output_path.with_extension("csv");
+                        if let Err(e) = export_parquet_to_csv(&output_path, &csv_path) {
+                            error_messages.push(format!("'{}' CSV export failed: {}", batch.name, e));
                         }
                     }
-                }
 
-                self.status_message = status;
-            }
-            Err(e) => {
-                self.status_message = format!("Error merging files: {}", e);
+                    self.merge_progress.message = format!(
+                        "'{}' completed ({} rows)",
+                        batch.name,
+                        row_count
+                    );
+                }
+                Err(e) => {
+                    error_messages.push(format!("'{}': {}", batch.name, e));
+                }
             }
         }
 
+        self.merge_progress.is_merging = false;
         self.is_processing = false;
+
+        if error_messages.is_empty() {
+            self.status_message = format!(
+                "Successfully merged {} batch(es) to: {}",
+                success_count,
+                output_dir.display()
+            );
+        } else {
+            self.status_message = format!(
+                "Merged {} batch(es), {} error(s): {}",
+                success_count,
+                error_messages.len(),
+                error_messages.join("; ")
+            );
+        }
     }
+}
+
+/// Check if there's a schema mismatch between files
+fn check_schema_mismatch(files: &[&PathBuf]) -> bool {
+    if files.len() < 2 {
+        return false;
+    }
+
+    let first_schema = match get_file_schema(files[0]) {
+        Some(s) => s,
+        None => return true, // Can't read schema, assume mismatch
+    };
+
+    for file in files.iter().skip(1) {
+        match get_file_schema(file) {
+            Some(schema) => {
+                if !schemas_compatible(&first_schema, &schema) {
+                    return true;
+                }
+            }
+            None => return true, // Can't read schema, assume mismatch
+        }
+    }
+
+    false
+}
+
+/// Get schema from a parquet file
+fn get_file_schema(path: &PathBuf) -> Option<Arc<Schema>> {
+    let file = std::fs::File::open(path).ok()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).ok()?;
+    Some(builder.schema().clone())
+}
+
+/// Generate a batch name from common parts of file names
+fn generate_batch_name(file_names: &[&str], batch_number: usize) -> String {
+    if file_names.is_empty() {
+        return format!("batch_{}", batch_number);
+    }
+
+    if file_names.len() == 1 {
+        return file_names[0].to_string();
+    }
+
+    // Try to find common prefix
+    let common_prefix = find_common_prefix(file_names);
+    if !common_prefix.is_empty() && common_prefix.len() >= 3 {
+        // Clean up trailing underscores, hyphens, or numbers
+        let cleaned = common_prefix
+            .trim_end_matches(|c: char| c == '_' || c == '-' || c.is_ascii_digit())
+            .trim_end_matches(|c: char| c == '_' || c == '-');
+        if !cleaned.is_empty() && cleaned.len() >= 3 {
+            return cleaned.to_string();
+        }
+    }
+
+    // Try to find common suffix
+    let common_suffix = find_common_suffix(file_names);
+    if !common_suffix.is_empty() && common_suffix.len() >= 3 {
+        let cleaned = common_suffix
+            .trim_start_matches(|c: char| c == '_' || c == '-' || c.is_ascii_digit())
+            .trim_start_matches(|c: char| c == '_' || c == '-');
+        if !cleaned.is_empty() && cleaned.len() >= 3 {
+            return cleaned.to_string();
+        }
+    }
+
+    // Try to find common substring
+    if let Some(common) = find_common_substring(file_names) {
+        if common.len() >= 3 {
+            return common;
+        }
+    }
+
+    format!("batch_{}", batch_number)
+}
+
+fn find_common_prefix(strings: &[&str]) -> String {
+    if strings.is_empty() {
+        return String::new();
+    }
+
+    let first = strings[0];
+    let mut prefix_len = first.len();
+
+    for s in strings.iter().skip(1) {
+        prefix_len = first
+            .chars()
+            .zip(s.chars())
+            .take(prefix_len)
+            .take_while(|(a, b)| a == b)
+            .count();
+    }
+
+    first.chars().take(prefix_len).collect()
+}
+
+fn find_common_suffix(strings: &[&str]) -> String {
+    if strings.is_empty() {
+        return String::new();
+    }
+
+    let reversed: Vec<String> = strings.iter().map(|s| s.chars().rev().collect()).collect();
+    let refs: Vec<&str> = reversed.iter().map(|s| s.as_str()).collect();
+    find_common_prefix(&refs).chars().rev().collect()
+}
+
+fn find_common_substring(strings: &[&str]) -> Option<String> {
+    if strings.is_empty() || strings[0].is_empty() {
+        return None;
+    }
+
+    let first = strings[0];
+
+    // Try substrings of decreasing length
+    for len in (3..=first.len()).rev() {
+        for start in 0..=(first.len() - len) {
+            let substring = &first[start..start + len];
+            // Skip if mostly numbers or special chars
+            if substring.chars().filter(|c| c.is_alphabetic()).count() < 2 {
+                continue;
+            }
+            if strings.iter().all(|s| s.contains(substring)) {
+                return Some(substring.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Sanitize a string for use as a filename
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn merge_parquet_files(files: &[PathBuf], output_path: &PathBuf) -> Result<usize, Box<dyn std::error::Error>> {
@@ -185,41 +432,58 @@ fn merge_parquet_files(files: &[PathBuf], output_path: &PathBuf) -> Result<usize
         return Err("No files to merge".into());
     }
 
-    // Read the first file to get the schema
-    let first_file = std::fs::File::open(&files[0])?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(first_file)?;
-    let schema = builder.schema().clone();
+    // Collect all schemas first
+    let mut schemas: Vec<Arc<Schema>> = Vec::new();
+    for file_path in files {
+        if let Some(schema) = get_file_schema(file_path) {
+            schemas.push(schema);
+        } else {
+            return Err(format!("Cannot read schema from: {}", file_path.display()).into());
+        }
+    }
 
-    // Collect all record batches from all files
+    // Check if all schemas are compatible
+    let all_compatible = schemas.windows(2).all(|w| schemas_compatible(&w[0], &w[1]));
+
+    let (output_schema, common_columns) = if all_compatible {
+        // All schemas match, use the first one
+        (schemas[0].clone(), None)
+    } else {
+        // Find common columns across all schemas
+        let common = find_common_columns(&schemas);
+        if common.is_empty() {
+            return Err("No common columns found across all files".into());
+        }
+        let new_schema = create_schema_from_columns(&schemas[0], &common);
+        (Arc::new(new_schema), Some(common))
+    };
+
     let mut all_batches: Vec<RecordBatch> = Vec::new();
 
     for file_path in files {
         let file = std::fs::File::open(file_path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-
-        // Check schema compatibility
-        let file_schema = builder.schema();
-        if !schemas_compatible(&schema, file_schema) {
-            return Err(format!(
-                "Schema mismatch in file: {}. Expected schema to match the first file.",
-                file_path.display()
-            ).into());
-        }
-
         let reader = builder.build()?;
+
         for batch_result in reader {
             let batch = batch_result?;
-            all_batches.push(batch);
+
+            // Project to common columns if needed
+            let projected_batch = if let Some(ref cols) = common_columns {
+                project_batch_to_columns(&batch, cols)?
+            } else {
+                batch
+            };
+
+            all_batches.push(projected_batch);
         }
     }
 
-    // Count total rows
     let total_rows: usize = all_batches.iter().map(|b| b.num_rows()).sum();
 
-    // Write all batches to output file
     let output_file = std::fs::File::create(output_path)?;
     let props = WriterProperties::builder().build();
-    let mut writer = ArrowWriter::try_new(output_file, schema, Some(props))?;
+    let mut writer = ArrowWriter::try_new(output_file, output_schema, Some(props))?;
 
     for batch in all_batches {
         writer.write(&batch)?;
@@ -228,6 +492,64 @@ fn merge_parquet_files(files: &[PathBuf], output_path: &PathBuf) -> Result<usize
     writer.close()?;
 
     Ok(total_rows)
+}
+
+/// Find columns that exist in all schemas with compatible types
+fn find_common_columns(schemas: &[Arc<Schema>]) -> Vec<String> {
+    if schemas.is_empty() {
+        return Vec::new();
+    }
+
+    let first_schema = &schemas[0];
+    let mut common: Vec<String> = Vec::new();
+
+    for field in first_schema.fields() {
+        let name = field.name();
+        let data_type = field.data_type();
+
+        // Check if this column exists in all other schemas with the same type
+        let exists_in_all = schemas.iter().skip(1).all(|schema| {
+            schema.field_with_name(name)
+                .map(|f| f.data_type() == data_type)
+                .unwrap_or(false)
+        });
+
+        if exists_in_all {
+            common.push(name.clone());
+        }
+    }
+
+    common
+}
+
+/// Create a new schema with only the specified columns
+fn create_schema_from_columns(original: &Arc<Schema>, columns: &[String]) -> Schema {
+    use arrow::datatypes::Field;
+
+    let fields: Vec<Arc<Field>> = columns
+        .iter()
+        .filter_map(|name| original.field_with_name(name).ok().map(|f| Arc::new(f.clone())))
+        .collect();
+
+    Schema::new(fields)
+}
+
+/// Project a record batch to only include specified columns
+fn project_batch_to_columns(batch: &RecordBatch, columns: &[String]) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    let schema = batch.schema();
+    let indices: Vec<usize> = columns
+        .iter()
+        .filter_map(|name| schema.index_of(name).ok())
+        .collect();
+
+    let projected_columns: Vec<Arc<dyn Array>> = indices
+        .iter()
+        .map(|&i| batch.column(i).clone())
+        .collect();
+
+    let new_schema = create_schema_from_columns(&schema, columns);
+
+    Ok(RecordBatch::try_new(Arc::new(new_schema), projected_columns)?)
 }
 
 fn schemas_compatible(schema1: &Arc<Schema>, schema2: &Arc<Schema>) -> bool {
@@ -252,7 +574,6 @@ fn export_parquet_to_csv(parquet_path: &PathBuf, csv_path: &PathBuf) -> Result<(
 
     let mut output = std::fs::File::create(csv_path)?;
 
-    // Write header row
     let headers: Vec<String> = schema
         .fields()
         .iter()
@@ -260,7 +581,6 @@ fn export_parquet_to_csv(parquet_path: &PathBuf, csv_path: &PathBuf) -> Result<(
         .collect();
     writeln!(output, "{}", headers.join(","))?;
 
-    // Write data rows
     for batch_result in reader {
         let batch = batch_result?;
 
@@ -384,15 +704,32 @@ impl eframe::App for ParquetMergerApp {
 
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.add_space(8.0);
-            if !self.status_message.is_empty() {
+
+            // Show progress bar if merging
+            if self.merge_progress.is_merging {
+                ui.horizontal(|ui| {
+                    let progress = self.merge_progress.current_batch as f32 / self.merge_progress.total_batches as f32;
+                    let progress_bar = egui::ProgressBar::new(progress)
+                        .text(format!(
+                            "{} ({}/{})",
+                            self.merge_progress.message,
+                            self.merge_progress.current_batch,
+                            self.merge_progress.total_batches
+                        ))
+                        .animate(true);
+                    ui.add(progress_bar);
+                });
+            } else if !self.status_message.is_empty() {
                 ui.label(&self.status_message);
             }
+
             ui.add_space(8.0);
         });
 
+        // Left panel - Folders
         egui::SidePanel::left("folders_panel")
             .resizable(true)
-            .default_width(250.0)
+            .default_width(200.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
                 ui.heading("Folders");
@@ -435,6 +772,92 @@ impl eframe::App for ParquetMergerApp {
                 }
             });
 
+        // Right panel - Batches
+        egui::SidePanel::right("batches_panel")
+            .resizable(true)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.heading("Batches");
+                    ui.add_space(8.0);
+                    ui.label(format!("({} total)", self.batches.len()));
+                });
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.is_processing && !self.batches.is_empty(),
+                            egui::Button::new("Merge Batches"),
+                        )
+                        .clicked()
+                    {
+                        self.merge_batches();
+                    }
+                    ui.checkbox(&mut self.export_to_csv, "CSV");
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                let mut batch_to_remove: Option<usize> = None;
+
+                egui::ScrollArea::vertical()
+                    .id_salt("batches_scroll")
+                    .show(ui, |ui| {
+                        for batch_idx in 0..self.batches.len() {
+                            let batch = &self.batches[batch_idx];
+                            let has_mismatch = batch.has_schema_mismatch;
+                            let file_count = batch.file_indices.len();
+
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    // Warning icon for schema mismatch
+                                    if has_mismatch {
+                                        ui.label(egui::RichText::new("⚠").color(egui::Color32::YELLOW))
+                                            .on_hover_text("Schema mismatch detected! Files have different columns or types.");
+                                    }
+
+                                    // Editable batch name
+                                    let name_response = ui.add(
+                                        egui::TextEdit::singleline(&mut self.batches[batch_idx].name)
+                                            .desired_width(120.0)
+                                            .hint_text("batch name")
+                                    );
+                                    if name_response.changed() {
+                                        // Name was edited
+                                    }
+
+                                    ui.label(format!("({})", file_count));
+
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("X").clicked() && !self.is_processing {
+                                            batch_to_remove = Some(batch_idx);
+                                        }
+                                    });
+                                });
+
+                                // Show files in this batch
+                                let batch = &self.batches[batch_idx];
+                                for &file_idx in &batch.file_indices {
+                                    if let Some(pq_file) = self.parquet_files.get(file_idx) {
+                                        ui.label(format!("  {}", &pq_file.display_path))
+                                            .on_hover_text(pq_file.full_path.to_string_lossy().to_string());
+                                    }
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
+                    });
+
+                if let Some(idx) = batch_to_remove {
+                    self.remove_batch(idx);
+                }
+            });
+
+        // Center panel - Parquet Files
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -444,28 +867,60 @@ impl eframe::App for ParquetMergerApp {
             });
             ui.add_space(8.0);
 
+            // Search filter
+            ui.horizontal(|ui| {
+                ui.label("Search:");
+                ui.add(egui::TextEdit::singleline(&mut self.search_filter).hint_text("Filter files..."));
+                if ui.small_button("Clear").clicked() {
+                    self.search_filter.clear();
+                }
+            });
+            ui.add_space(8.0);
+
+            // Collect filtered file indices
+            let search_lower = self.search_filter.to_lowercase();
+            let filtered_indices: Vec<usize> = self
+                .parquet_files
+                .iter()
+                .enumerate()
+                .filter(|(_, pq_file)| {
+                    search_lower.is_empty() || pq_file.display_path.to_lowercase().contains(&search_lower)
+                })
+                .map(|(i, _)| i)
+                .collect();
+
             ui.horizontal(|ui| {
                 if ui.button("Select All").clicked() && !self.is_processing {
-                    self.select_all();
+                    // Select only filtered files
+                    for &i in &filtered_indices {
+                        self.selected_files.insert(i);
+                    }
                 }
                 if ui.button("Deselect All").clicked() && !self.is_processing {
-                    self.deselect_all();
+                    // Deselect only filtered files
+                    for &i in &filtered_indices {
+                        self.selected_files.remove(&i);
+                    }
                 }
                 ui.add_space(16.0);
                 let selected_count = self.selected_files.len();
                 ui.label(format!("{} selected", selected_count));
+                if !search_lower.is_empty() {
+                    ui.label(format!("({} shown)", filtered_indices.len()));
+                }
                 ui.add_space(16.0);
+
+                // Add to batch button
                 if ui
                     .add_enabled(
                         !self.is_processing && selected_count > 0,
-                        egui::Button::new("Merge Selected"),
+                        egui::Button::new(" > "),
                     )
+                    .on_hover_text("Add selected files as a new batch")
                     .clicked()
                 {
-                    self.merge_selected();
+                    self.add_batch();
                 }
-                ui.add_space(16.0);
-                ui.checkbox(&mut self.export_to_csv, "Also export to CSV");
             });
 
             ui.add_space(8.0);
@@ -475,7 +930,8 @@ impl eframe::App for ParquetMergerApp {
             egui::ScrollArea::vertical()
                 .id_salt("files_scroll")
                 .show(ui, |ui| {
-                    for (i, pq_file) in self.parquet_files.iter().enumerate() {
+                    for &i in &filtered_indices {
+                        let pq_file = &self.parquet_files[i];
                         let mut is_selected = self.selected_files.contains(&i);
 
                         ui.horizontal(|ui| {
@@ -486,7 +942,6 @@ impl eframe::App for ParquetMergerApp {
                                     self.selected_files.remove(&i);
                                 }
                             }
-                            // Display relative path, hover shows full path
                             ui.label(&pq_file.display_path)
                                 .on_hover_text(pq_file.full_path.to_string_lossy());
                         });
