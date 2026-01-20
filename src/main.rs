@@ -5,6 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use walkdir::WalkDir;
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum ThemeMode {
+    #[default]
+    Dark,
+    Light,
+}
+
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -82,6 +89,8 @@ struct ParquetMergerApp {
     auto_remove_completed: bool,
     /// Enable smart batching (auto-group files by filename)
     smart_batch_enabled: bool,
+    /// Theme mode (Dark or Light)
+    theme_mode: ThemeMode,
 }
 
 impl Default for ParquetMergerApp {
@@ -97,7 +106,8 @@ impl Default for ParquetMergerApp {
             merge_progress: MergeProgress::default(),
             search_filter: String::new(),
             auto_remove_completed: true,
-            smart_batch_enabled: true, // Default to true
+            smart_batch_enabled: true,
+            theme_mode: ThemeMode::default(),
         }
     }
 }
@@ -817,9 +827,26 @@ fn get_cell_value_as_string(array: &Arc<dyn Array>, idx: usize) -> String {
 
 impl eframe::App for ParquetMergerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply theme
+        match self.theme_mode {
+            ThemeMode::Dark => ctx.set_visuals(egui::Visuals::dark()),
+            ThemeMode::Light => ctx.set_visuals(egui::Visuals::light()),
+        }
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.add_space(8.0);
-            ui.heading("Parquet File Merger");
+            ui.horizontal(|ui| {
+                ui.heading("Parquet File Merger");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_label("")
+                        .selected_text(format!("{:?}", self.theme_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.theme_mode, ThemeMode::Dark, "Dark");
+                            ui.selectable_value(&mut self.theme_mode, ThemeMode::Light, "Light");
+                        });
+                    ui.label("Theme:");
+                });
+            });
             ui.add_space(4.0);
         });
 
