@@ -80,6 +80,8 @@ struct ParquetMergerApp {
     search_filter: String,
     /// Auto-remove batches after successful merge
     auto_remove_completed: bool,
+    /// Enable smart batching (auto-group files by filename)
+    smart_batch_enabled: bool,
 }
 
 impl Default for ParquetMergerApp {
@@ -94,7 +96,8 @@ impl Default for ParquetMergerApp {
             export_to_csv: false,
             merge_progress: MergeProgress::default(),
             search_filter: String::new(),
-            auto_remove_completed: true, // Default to true
+            auto_remove_completed: true,
+            smart_batch_enabled: true, // Default to true
         }
     }
 }
@@ -157,7 +160,15 @@ impl ParquetMergerApp {
         }
 
         self.parquet_files.sort_by(|a, b| a.display_path.cmp(&b.display_path));
-        self.status_message = format!("Found {} parquet file(s).", self.parquet_files.len());
+
+        let file_count = self.parquet_files.len();
+
+        // Auto-run smart batching if enabled
+        if self.smart_batch_enabled && file_count > 0 {
+            self.smart_batch();
+        } else {
+            self.status_message = format!("Found {} parquet file(s).", file_count);
+        }
     }
 
     fn add_batch(&mut self) {
@@ -213,6 +224,67 @@ impl ParquetMergerApp {
         }
     }
 
+    fn smart_batch(&mut self) {
+        use std::collections::HashMap;
+
+        if self.parquet_files.is_empty() {
+            self.status_message = "No files to batch. Add a folder and scan first.".to_string();
+            return;
+        }
+
+        // Group files by their filename (ignoring path)
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+
+        for (idx, pq_file) in self.parquet_files.iter().enumerate() {
+            let filename = pq_file.full_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            groups.entry(filename).or_default().push(idx);
+        }
+
+        // Create batches for groups with more than one file
+        let mut batches_created = 0;
+        let mut single_files = 0;
+
+        for (filename, file_indices) in groups {
+            if file_indices.len() > 1 {
+                // Get file paths for schema check
+                let file_paths: Vec<&PathBuf> = file_indices
+                    .iter()
+                    .filter_map(|&i| self.parquet_files.get(i).map(|f| &f.full_path))
+                    .collect();
+
+                let has_schema_mismatch = check_schema_mismatch(&file_paths);
+
+                // Use filename without extension as batch name
+                let name = std::path::Path::new(&filename)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("batch_{}", self.batches.len() + 1));
+
+                self.batches.push(Batch {
+                    file_indices,
+                    name,
+                    has_schema_mismatch,
+                });
+                batches_created += 1;
+            } else {
+                single_files += 1;
+            }
+        }
+
+        if batches_created > 0 {
+            self.status_message = format!(
+                "Smart batching: created {} batch(es). {} file(s) had no matches.",
+                batches_created, single_files
+            );
+        } else {
+            self.status_message = "No files with matching names found across different paths.".to_string();
+        }
+    }
+
     fn merge_batches(&mut self) {
         if self.batches.is_empty() {
             self.status_message = "No batches to merge. Add batches first using '>'.".to_string();
@@ -237,6 +309,15 @@ impl ParquetMergerApp {
             message: "Starting merge...".to_string(),
         };
 
+        // Create "merged" subdirectory
+        let out_dir = output_dir.join("merged");
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            self.status_message = format!("Failed to create output directory: {}", e);
+            self.is_processing = false;
+            self.merge_progress.is_merging = false;
+            return;
+        }
+
         let mut success_count = 0;
         let mut error_messages: Vec<String> = Vec::new();
         let mut successful_batch_indices: Vec<usize> = Vec::new();
@@ -258,7 +339,7 @@ impl ParquetMergerApp {
 
             // Sanitize batch name for filename
             let safe_name = sanitize_filename(&batch.name);
-            let output_path = output_dir.join(format!("{}.parquet", safe_name));
+            let output_path = out_dir.join(format!("{}.parquet", safe_name));
 
             match merge_parquet_files(&files_to_merge, &output_path) {
                 Ok(row_count) => {
@@ -300,7 +381,7 @@ impl ParquetMergerApp {
             self.status_message = format!(
                 "Successfully merged {} batch(es) to: {}",
                 success_count,
-                output_dir.display()
+                out_dir.display()
             );
         } else {
             self.status_message = format!(
@@ -594,6 +675,11 @@ fn schemas_compatible(schema1: &Arc<Schema>, schema2: &Arc<Schema>) -> bool {
     true
 }
 
+/// Check if a column name is an internal/index column that should be excluded
+fn is_internal_column(name: &str) -> bool {
+    name.starts_with("__") && name.ends_with("__")
+}
+
 fn export_parquet_to_csv(parquet_path: &PathBuf, csv_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let file = std::fs::File::open(parquet_path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
@@ -602,10 +688,18 @@ fn export_parquet_to_csv(parquet_path: &PathBuf, csv_path: &PathBuf) -> Result<(
 
     let mut output = std::fs::File::create(csv_path)?;
 
-    let headers: Vec<String> = schema
+    // Get indices of columns to include (excluding internal columns like __index_level_0__)
+    let column_indices: Vec<usize> = schema
         .fields()
         .iter()
-        .map(|f| escape_csv_field(f.name()))
+        .enumerate()
+        .filter(|(_, f)| !is_internal_column(f.name()))
+        .map(|(i, _)| i)
+        .collect();
+
+    let headers: Vec<String> = column_indices
+        .iter()
+        .map(|&i| escape_csv_field(schema.field(i).name()))
         .collect();
     writeln!(output, "{}", headers.join(","))?;
 
@@ -613,10 +707,9 @@ fn export_parquet_to_csv(parquet_path: &PathBuf, csv_path: &PathBuf) -> Result<(
         let batch = batch_result?;
 
         for row_idx in 0..batch.num_rows() {
-            let row: Vec<String> = batch
-                .columns()
+            let row: Vec<String> = column_indices
                 .iter()
-                .map(|col| get_cell_value_as_string(col, row_idx))
+                .map(|&col_idx| get_cell_value_as_string(batch.column(col_idx), row_idx))
                 .collect();
             writeln!(output, "{}", row.join(","))?;
         }
@@ -771,6 +864,9 @@ impl eframe::App for ParquetMergerApp {
                         self.scan_folders();
                     }
                 });
+
+                ui.checkbox(&mut self.smart_batch_enabled, "Smart batch")
+                    .on_hover_text("Auto-group files with same name from different paths");
 
                 ui.add_space(8.0);
                 ui.separator();

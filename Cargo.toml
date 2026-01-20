@@ -1,5 +1,5 @@
 [package]
-name = "parquete-merger"
+name = "parquet-merger"
 version = "0.1.0"
 edition = "2021"
 
