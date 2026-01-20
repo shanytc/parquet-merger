@@ -1,0 +1,11 @@
+[package]
+name = "parquete-merger"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+rfd = "0.15"
+parquet = { version = "53", features = ["arrow"] }
+arrow = "53"
+walkdir = "2.5"
