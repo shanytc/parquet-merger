@@ -7,5 +7,6 @@ easy to use .parquet file merger! no more doing it in pandas lol
 4. to add a new batch, select the files u want to merbe and click < or > to add or remove from the batch window.
 5. click merge will save the merged file in merge/ folder in the path u choose.
 
-<img width="1106" height="622" alt="image" src="https://github.com/user-attachments/assets/7195d27d-6457-4592-a61b-8775808b2fc3" />
+<img width="1103" height="618" alt="image" src="https://github.com/user-attachments/assets/f60897d1-aaf1-4511-8cb7-0968b0f26bc9" />
+
 
